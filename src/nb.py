@@ -1,381 +1,997 @@
-#%%
 import numpy as np
-import uuid
-from enum import Enum
-from typing import Optional
-from scipy.special import expit
-from scipy.stats import norm
-#%%
-#######class####
-#######################################################################
-# Classes
-#######################################################################
+import matplotlib.pyplot as plt
+from matplotlib import cm
+import seaborn as sns
+from collections import defaultdict
+from tqdm import tqdm
+import itertools
+from mpl_toolkits.mplot3d import Axes3D
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-class MatingStrategy(Enum):    
-    ONE_TO_ONE = "one_to_one"
-    ALL_VS_ALL = "all_vs_all"
-    MATING_TYPES = "mating_types"
 
-class MatingType(Enum):
-    A = "A"
-    ALPHA = "alpha"
-
-class AlternativeFitnessMethod(Enum):
-    """Enumeration of available fitness calculation methods."""
-    SHERRINGTON_KIRKPATRICK = "sherrington_kirkpatrick"  # Original complex method
-    SINGLE_POSITION = "single_position"  # Simple method based on a single position
-    ADDITIVE = "additive"  # Simple additive method with no interactions
-
-class DiploidOrganism:
-    def __init__(self, parent1, parent2, fitness_model="dominant", mating_type=None):
-        if len(parent1.genome) != len(parent2.genome):
-            raise ValueError("Parent genomes must have the same length.")
-        
-        self.allele1 = parent1.genome.copy()
-        self.allele2 = parent2.genome.copy()
-        self.fitness_model = fitness_model
-        self.environment = parent1.environment
-        self.id = str(uuid.uuid4())
-        self.parent1_id = parent1.id
-        self.parent2_id = parent2.id
-        self.mating_type = mating_type
-        
-        # *** Store individual parent fitness values ***
-        self.parent1_fitness = parent1.fitness
-        self.parent2_fitness = parent2.fitness
-        
-        # Compute average parent fitness (used elsewhere) but not for the heatmap
-        self.avg_parent_fitness = (parent1.fitness + parent2.fitness) / 2
-        
-        self.fitness = self.calculate_fitness()
-
-    def _get_effective_genome(self):
-        """
-        Calculate effective genome based on inheritance model.
-        
-        For codominant model:
-        - If alleles are the same (1,1) or (-1,-1): use that value
-        - If alleles are different (1,-1) or (-1,1): use 0.5 * (allele1 + allele2)
-        - If environment prefers 1 and alleles are (1,1): returns 1
-        """
-         # Special handling for genome size 1
-        if len(self.allele1) == 1:
-            if self.fitness_model == "dominant":
-                return np.array([-1]) if -1 in [self.allele1[0], self.allele2[0]] else np.array([1])
-            elif self.fitness_model == "recessive":
-                return np.array([-1]) if self.allele1[0] == -1 and self.allele2[0] == -1 else np.array([1])
-            elif self.fitness_model == "codominant":
-                if self.allele1[0] == self.allele2[0]:
-                    return self.allele1.copy()
-                else:
-                    return np.array([0])  # Average of -1 and 1
+class NKModel:
+    """
+    Implementation of the NK Model for creating tunable fitness landscapes.
     
-        
-        if self.fitness_model == "dominant":
-            return np.where((self.allele1 == -1) | (self.allele2 == -1), -1, 1)
-        elif self.fitness_model == "recessive":
-            return np.where((self.allele1 == -1) & (self.allele2 == -1), -1, 1)
-        elif self.fitness_model == "codominant":
-            # Create a mask for mixed alleles (1,-1 or -1,1)
-            mixed_alleles = self.allele1 != self.allele2
-            
-            # For mixed alleles, calculate the average (will give 0.5 * (1 + -1) = 0)
-            # For same alleles, use either allele (they're the same)
-            effective = np.where(
-                mixed_alleles,
-                0.5 * (self.allele1 + self.allele2),  # Mixed case: average of alleles
-                self.allele1  # Same alleles case: use either allele
-            )            
-            # Special case: if environment prefers 1 and both alleles are 1
-            both_positive = (self.allele1 == 1) & (self.allele2 == 1)
-            effective = np.where(both_positive, 1, effective)
-            
-            return effective
-        else:
-            raise ValueError(f"Unknown fitness model: {self.fitness_model}")
-
-    def calculate_fitness(self):
-        """Calculate fitness using the effective genome and the environment's calculation method."""
-        effective_genome = self._get_effective_genome()
-        return self.environment.calculate_fitness(effective_genome)
-
-class OrganismWithMatingType:
-    def __init__(self, organism, mating_type):
-        self.organism = organism
-        self.mating_type = mating_type
-
-class Environment:
-    """
-    Represents an environment with a fitness landscape for simulating evolutionary dynamics.
     Attributes:
-        genome_size (int): The size of the genome.
-        beta (float): A parameter controlling the ruggedness of the fitness landscape. Default is 0.5.
-        rho (float): A parameter controlling the correlation between genome sites in the fitness landscape. Default is 0.25.
-        seed (int or None): A seed for the random number generator to ensure reproducibility. Default is None.
-        h (numpy.ndarray): The initialized fitness contributions of individual genome sites.
-        J (numpy.ndarray): The initialized interaction matrix between genome sites.
+        N (int): Number of genes in the genome
+        K (int): Number of other genes each gene interacts with (epistasis parameter)
+        interaction_matrix (np.ndarray): Matrix defining which genes interact with each other
+        contribution_tables (list): Fitness contribution tables for each gene
+        
     Methods:
-        calculate_fitness(genome):
-            Calculates the fitness of a given genome based on the fitness landscape.
+        generate_random_interaction_matrix(): Creates a random interaction matrix
+        generate_contribution_tables(): Creates random fitness contribution tables
+        calculate_fitness(genome): Calculates fitness for a given genome
+        generate_fitness_landscape(): Generates the complete fitness landscape
+        find_local_optima(): Identifies all local optima in the landscape
+        get_neighbors(genome): Gets all one-bit mutation neighbors of a genome
+        visualize_landscape(): Visualizes the fitness landscape
+        analyze_landscape_ruggedness(): Analyzes the ruggedness by counting local optima
     """
-    def __init__(self, genome_size, beta=0.5, rho=0.25, seed=None, 
-                 fitness_method=AlternativeFitnessMethod.SHERRINGTON_KIRKPATRICK):
-        self.genome_size = genome_size
-        self.beta = beta
-        self.rho = rho
-        self.seed = seed
-        self.fitness_method = fitness_method
         
-        # Use seeded RNG only for environment initialization
-        env_rng = np.random.default_rng(seed)
+    def __init__(self, N, K, seed=None):
+            """
+            Initialize the NK Model.
+            
+            Args:
+                N (int): Number of genes in the genome
+                K (int): Number of other genes each gene interacts with (0 <= K < N)
+                seed (int, optional): Random seed for reproducibility
+            """
+            if K >= N:
+                raise ValueError(f"K must be less than N. Got K={K}, N={N}")
+            
+            self.N = N
+            self.K = K
+            self.rng = np.random.RandomState(seed)
+            
+            # Generate interaction matrix and contribution tables
+            self.interaction_matrix = self.generate_random_interaction_matrix()
+            self.contribution_tables = self.generate_contribution_tables()
+            
+            # Cache for fitness values to avoid recalculation
+            self.fitness_cache = {}
+
+    def generate_random_interaction_matrix(self):
+        """
+        Generate a random interaction matrix where each gene interacts with K other genes.
         
-        # Initialize fitness landscape based on the method
-        if fitness_method == AlternativeFitnessMethod.SHERRINGTON_KIRKPATRICK:
-            # Original method - initialize h and J
-            self.h = init_h(self.genome_size, self.beta, random_state=env_rng)
-            self.J = init_J(self.genome_size, self.beta, self.rho, random_state=env_rng)
-            self.alternative_params = None
-        else:
-            # Alternative method - initialize appropriate parameters
-            self.h = None
-            self.J = None
-            self.alternative_params = init_alternative_fitness(
-                self.genome_size, method=fitness_method, random_state=env_rng)
+        Returns:
+            np.ndarray: An N x (K+1) matrix where each row i contains the indices of 
+                        genes that affect gene i (including i itself)
+        """
+        interaction_matrix = np.zeros((self.N, self.K + 1), dtype=int)
         
+        for i in range(self.N):
+            # Each gene always interacts with itself
+            interaction_matrix[i, 0] = i
+            
+            # Select K other genes randomly
+            other_genes = [j for j in range(self.N) if j != i]
+            selected = self.rng.choice(other_genes, self.K, replace=False)
+            interaction_matrix[i, 1:] = selected
+            
+        return interaction_matrix
+    
+    def generate_contribution_tables(self):
+        """
+        Generate random fitness contribution tables for each gene.
+        
+        Returns:
+            list: A list of 2^(K+1) fitness contributions for each gene
+        """
+        contribution_tables = []
+        
+        for i in range(self.N):
+            # Create a table for each possible state of the gene and its K interacting genes
+            # There are 2^(K+1) possible states
+            table = self.rng.random(2**(self.K + 1))
+            contribution_tables.append(table)
+            
+        return contribution_tables
+    
     def calculate_fitness(self, genome):
-        """Calculate fitness for a genome based on this environment's landscape."""
-        if self.fitness_method == AlternativeFitnessMethod.SHERRINGTON_KIRKPATRICK:
-            # Original complex fitness calculation
-            energy = compute_fit_slow(genome, self.h, self.J, F_off=0.0)
-            return energy
-        else:
-            # Alternative simplified fitness calculation
-            return calculate_alternative_fitness(genome, self.alternative_params)
-    
-    def get_fitness_description(self):
-        """Return a human-readable description of the fitness calculation method."""
-        if self.fitness_method == AlternativeFitnessMethod.SHERRINGTON_KIRKPATRICK:
-            return "Sherrington-Kirkpatrick model (complex interactions)"
-        elif self.fitness_method == AlternativeFitnessMethod.SINGLE_POSITION:
-            pos = self.alternative_params["position"]
-            return f"Single position model (position {pos} determines fitness)"
-        elif self.fitness_method == AlternativeFitnessMethod.ADDITIVE:
-            return "Additive model (each position contributes independently)"
-        return "Unknown fitness method" 
-
-class Organism:
-    """
-    Represents an organism in a simulated environment with a genome, fitness, and mutation capabilities.
-
-    Attributes:
-        id (str): A unique identifier for the organism.
-        environment (Environment): The environment in which the organism exists.
-        genome (numpy.ndarray): The genome of the organism, represented as an array of -1 and 1.
-        generation (int): The generation number of the organism.
-        parent_id (str or None): The ID of the parent organism, if applicable.
-        mutation_rate (float): The probability of mutation at each genome site.
-        fitness (float): The fitness value of the organism, calculated based on its genome and environment.
-
-    Methods:
-        calculate_fitness():
-            Calculates and returns the fitness of the organism based on its genome and environment.
-
-        mutate():
-            Introduces mutations to the organism's genome based on the mutation rate and updates its fitness.
-    """
-    def __init__(self, environment, genome=None, generation=0, parent_id=None, 
-                mutation_rate=None, genome_seed=None, mutation_seed=None):
-        self.id = str(uuid.uuid4())
-        self.environment = environment
+        """
+        Calculate the fitness of a genome based on the NK model.
         
-        # Create a new RNG with the provided seed for genome initialization
-        genome_rng = np.random.default_rng(genome_seed)
-        
-        # For mutation RNG, combine the base mutation seed with a unique value for this organism
-        # This ensures each organism has its own RNG stream but remains reproducible
-        if mutation_seed is not None:
-            # Create a value unique to this organism based on generation and a random component
-            # Use genome_rng to generate this component for reproducibility
-            unique_addition = generation * 1000 + genome_rng.integers(1000)
-            organism_mutation_seed = mutation_seed + unique_addition
-        else:
-            organism_mutation_seed = None
+        Args:
+            genome (np.ndarray or list): Binary genome of length N (0s and 1s)
             
-        # Use seeded RNG for mutations
-        self.rng = np.random.default_rng(organism_mutation_seed)
+        Returns:
+            float: The fitness value of the genome
+        """
+        # Convert genome to tuple for caching
+        genome_tuple = tuple(genome)
         
-        if genome is None:
-            self.genome = genome_rng.choice([-1, 1], environment.genome_size)
+        # Return cached value if available
+        if genome_tuple in self.fitness_cache:
+            return self.fitness_cache[genome_tuple]
+        
+        fitness_contributions = []
+        
+        for i in range(self.N):
+            # Get the state of gene i and its interacting genes
+            interacting_genes = self.interaction_matrix[i]
+            state = [genome[j] for j in interacting_genes]
+            
+            # Convert state to an index for the contribution table
+            # Example: state [1,0,1] becomes 1*2^0 + 0*2^1 + 1*2^2 = 5
+            index = sum(state[j] * (2 ** j) for j in range(len(state)))
+            
+            # Get the fitness contribution for this state
+            contribution = self.contribution_tables[i][index]
+            fitness_contributions.append(contribution)
+        
+        # Calculate overall fitness as the average of all contributions
+        fitness = sum(fitness_contributions) / self.N
+        
+        # Cache the result
+        self.fitness_cache[genome_tuple] = fitness
+        
+        return fitness
+    
+    def generate_fitness_landscape(self):
+        """
+        Generate the complete fitness landscape for all possible genomes.
+        
+        Returns:
+            dict: A dictionary mapping genome tuples to fitness values
+        """
+        landscape = {}
+        
+        # Generate all possible binary genomes of length N
+        all_genomes = list(itertools.product([0, 1], repeat=self.N))
+        
+        # Calculate fitness for each genome
+        for genome in tqdm(all_genomes, desc=f"Generating landscape for K={self.K}"):
+            landscape[genome] = self.calculate_fitness(genome)
+            
+        return landscape
+    
+    def get_neighbors(self, genome):
+        """
+        Get all one-bit mutation neighbors of a genome.
+        
+        Args:
+            genome (tuple): The genome as a tuple
+            
+        Returns:
+            list: List of neighbor genomes (as tuples)
+        """
+        neighbors = []
+        
+        for i in range(self.N):
+            # Create a new genome with the i-th bit flipped
+            neighbor = list(genome)
+            neighbor[i] = 1 - neighbor[i]  # Flip 0 to 1 or 1 to 0
+            neighbors.append(tuple(neighbor))
+            
+        return neighbors
+    
+    def find_local_optima(self, landscape=None):
+        """
+        Find all local optima in the fitness landscape.
+        
+        Args:
+            landscape (dict, optional): Pre-generated fitness landscape
+            
+        Returns:
+            list: List of genome tuples that are local optima
+        """
+        if landscape is None:
+            landscape = self.generate_fitness_landscape()
+            
+        local_optima = []
+        
+        for genome, fitness in landscape.items():
+            # Get all neighbors
+            neighbors = self.get_neighbors(genome)
+            
+            # Check if this genome has higher fitness than all neighbors
+            is_local_optimum = True
+            for neighbor in neighbors:
+                if landscape[neighbor] > fitness:
+                    is_local_optimum = False
+                    break
+                    
+            if is_local_optimum:
+                local_optima.append(genome)
+                
+        return local_optima
+    
+    def analyze_landscape_ruggedness(self, num_samples=None):
+        """
+        Analyze the ruggedness of the landscape by counting local optima.
+        
+        Args:
+            num_samples (int, optional): Number of random genomes to sample for fitness
+            
+        Returns:
+            dict: Dictionary containing metrics about landscape ruggedness
+        """
+        # Generate the complete landscape if it's small enough
+        if self.N <= 16:  # 2^16 = 65,536 genomes
+            landscape = self.generate_fitness_landscape()
+            local_optima = self.find_local_optima(landscape)
+            
+            # Calculate average fitness
+            avg_fitness = sum(landscape.values()) / len(landscape)
+            
+            # Calculate fitness correlation
+            fitnesses = list(landscape.values())
+            mean_fitness = np.mean(fitnesses)
+            std_fitness = np.std(fitnesses)
+            
+            return {
+                'num_local_optima': len(local_optima),
+                'fraction_local_optima': len(local_optima) / len(landscape),
+                'avg_fitness': avg_fitness,
+                'fitness_std': std_fitness
+            }
         else:
-            self.genome = genome.copy()
-        self.generation = generation
-        self.parent_id = parent_id
-        self.mutation_rate = mutation_rate if mutation_rate is not None else 1.0/environment.genome_size
-        self.fitness = self.calculate_fitness()
-
-    def calculate_fitness(self):
-        return self.environment.calculate_fitness(self.genome)
-
-    def mutate(self):
-        # Use the organism's own unseeded RNG for mutations
-        mutation_sites = self.rng.random(len(self.genome)) < self.mutation_rate
-        self.genome[mutation_sites] *= -1
-        self.fitness = self.calculate_fitness()
-
-    def reproduce(self, mutation_seed=None):
-        # When creating children, we pass the base mutation seed
-        # Each child will generate its unique seed in its __init__ method
-        child1 = Organism(self.environment, genome=self.genome,
-                        generation=self.generation + 1, parent_id=self.id,
-                        mutation_rate=self.mutation_rate, mutation_seed=mutation_seed)
+            # For large N, sample the landscape
+            if num_samples is None:
+                num_samples = min(10000, 2**self.N)
+                
+            # Sample random genomes
+            samples = []
+            for _ in range(num_samples):
+                genome = tuple(self.rng.randint(0, 2, self.N))
+                samples.append((genome, self.calculate_fitness(genome)))
+                
+            # Calculate average fitness
+            avg_fitness = sum(f for _, f in samples) / len(samples)
+                
+            return {
+                'avg_fitness': avg_fitness,
+                'note': 'Full landscape analysis not performed due to large N'
+            }
+    
+    def visualize_landscape(self, max_dims=2):
+        """
+        Visualize the fitness landscape for small N.
         
-        child2 = Organism(self.environment, genome=self.genome,
-                        generation=self.generation + 1, parent_id=self.id,
-                        mutation_rate=self.mutation_rate, mutation_seed=mutation_seed)
+        Args:
+            max_dims (int): Maximum number of dimensions to visualize (1 or 2)
+            
+        Returns:
+            matplotlib.figure.Figure: The plot figure
+        """
+        if self.N > max_dims:
+            print(f"WARNING: N={self.N} is too large to visualize directly. Showing projection.")
         
-        return child1, child2
+        if max_dims == 1:
+            # 1D visualization (for N=1)
+            fig, ax = plt.subplots(figsize=(10, 6))
+            
+            genomes = [(0,), (1,)]
+            fitnesses = [self.calculate_fitness(g) for g in genomes]
+            
+            ax.bar([0, 1], fitnesses)
+            ax.set_xlabel('Genome')
+            ax.set_ylabel('Fitness')
+            ax.set_title(f'NK Model Fitness Landscape (N={self.N}, K={self.K})')
+            ax.set_xticks([0, 1])
+            ax.set_xticklabels(['0', '1'])
+            
+        elif max_dims == 2:
+            if self.N >= 2:
+                # 2D visualization (for N=2 or projection of higher dims)
+                fig, ax = plt.subplots(figsize=(10, 8))
+                
+                # For N=2, visualize the complete landscape
+                if self.N == 2:
+                    # Generate all 4 possible genomes
+                    x = np.array([0, 0, 1, 1])
+                    y = np.array([0, 1, 0, 1])
+                    genomes = [(x[i], y[i]) for i in range(4)]
+                    fitnesses = [self.calculate_fitness(g) for g in genomes]
+                    
+                    # 3D surface plot
+                    ax = fig.add_subplot(111, projection='3d')
+                    ax.plot_trisurf(x, y, fitnesses, cmap=cm.viridis, linewidth=0.2)
+                    ax.set_xlabel('Gene 1')
+                    ax.set_ylabel('Gene 2')
+                    ax.set_zlabel('Fitness')
+                    ax.set_title(f'NK Model Fitness Landscape (N={self.N}, K={self.K})')
+                    
+                # For N>2, create a heatmap projection
+                else:
+                    # Generate all combinations of the first two genes
+                    x_vals = np.array([0, 0, 1, 1])
+                    y_vals = np.array([0, 1, 0, 1])
+                    
+                    # For each combination, generate multiple random configurations of other genes
+                    # and calculate average fitness
+                    z = np.zeros((2, 2))
+                    samples_per_cell = 50
+                    
+                    for i, x in enumerate([0, 1]):
+                        for j, y in enumerate([0, 1]):
+                            avg_fitness = 0
+                            for _ in range(samples_per_cell):
+                                # Generate random values for the other N-2 genes
+                                other_genes = self.rng.randint(0, 2, self.N - 2)
+                                genome = np.array([x, y, *other_genes])
+                                avg_fitness += self.calculate_fitness(genome)
+                            z[i, j] = avg_fitness / samples_per_cell
+                    
+                    # Create heatmap
+                    sns.heatmap(z, annot=True, fmt=".3f", cmap="viridis", 
+                              xticklabels=[0, 1], yticklabels=[0, 1],
+                              cbar_kws={'label': 'Average Fitness'})
+                    ax.set_xlabel('Gene 2')
+                    ax.set_ylabel('Gene 1')
+                    ax.set_title(f'NK Model Average Fitness Projection (N={self.N}, K={self.K})')
+            else:
+                # Fallback to 1D for N=1
+                return self.visualize_landscape(max_dims=1)
+                
+        plt.tight_layout()
+        return fig
 
-
-
-#%%
-def compute_fit_slow(sigma, his, Jijs, F_off=0.0):
+def analyze_NK_model_ruggedness(N, K_values, num_runs=5, seed=42):
     """
-    Compute the fitness of the genome configuration sigma using full slow computation.
-
-    Parameters:
-    sigma (np.ndarray): The genome configuration (vector of -1 or 1).
-    his (np.ndarray): The vector of site-specific contributions to fitness.
-    Jijs (np.ndarray): The interaction matrix between genome sites.
-    F_off (float): The fitness offset, defaults to 0.
-
+    Analyze how landscape ruggedness changes with different K values.
+    
+    Args:
+        N (int): Number of genes
+        K_values (list): List of K values to test
+        num_runs (int): Number of runs for each K value
+        seed (int): Random seed for reproducibility
+        
     Returns:
-    float: The fitness value for the configuration sigma.
-    Divide by 2 because every term appears twice in symmetric case.
+        dict: Dictionary with analysis results
     """
-    return sigma @ (his + 0.5 * Jijs @ sigma) - F_off
-
-def init_J(N, beta, rho, random_state=None):
-    """
-    Initialize the coupling matrix for the Sherrington-Kirkpatrick model with sparsity.
-    """
-    if not (0 < rho <= 1):
-        raise ValueError("rho must be between 0 (exclusive) and 1 (inclusive).")
+    results = {
+        'K_values': K_values,
+        'avg_local_optima': [],
+        'avg_fitness': [],
+        'local_optima_stderr': [],
+        'fitness_stderr': []
+    }
     
-    rng = np.random.default_rng(random_state)
-    
-    # Handle special case when N=1
-    if N == 1:
-        return np.zeros((1, 1))  # Return a 1x1 zero matrix
+    for K in K_values:
+        local_optima_counts = []
+        avg_fitnesses = []
         
-    sig_J = np.sqrt(beta / (N * rho))  # Adjusted standard deviation for sparsity
+        for run in range(num_runs):
+            # Create model with different seed for each run
+            model = NKModel(N=N, K=K, seed=seed + run)
+            
+            # Analyze landscape
+            analysis = model.analyze_landscape_ruggedness()
+            
+            if 'num_local_optima' in analysis:
+                local_optima_counts.append(analysis['num_local_optima'])
+            avg_fitnesses.append(analysis['avg_fitness'])
+        
+        # Calculate average metrics across runs
+        if local_optima_counts:
+            results['avg_local_optima'].append(np.mean(local_optima_counts))
+            results['local_optima_stderr'].append(np.std(local_optima_counts) / np.sqrt(len(local_optima_counts)))
+        else:
+            results['avg_local_optima'].append(None)
+            results['local_optima_stderr'].append(None)
+            
+        results['avg_fitness'].append(np.mean(avg_fitnesses))
+        results['fitness_stderr'].append(np.std(avg_fitnesses) / np.sqrt(len(avg_fitnesses)))
     
-    # Initialize an empty upper triangular matrix (excluding diagonal)
-    J_upper = np.zeros((N, N))
-    
-    # Total number of upper triangular elements excluding diagonal
-    total_elements = N * (N - 1) // 2
-    
-    # Number of non-zero elements based on rho
-    num_nonzero = int(np.floor(rho * total_elements))
-    if num_nonzero == 0 and rho > 0:
-        num_nonzero = 1  # Ensure at least one non-zero element if rho > 0
-    
-    # Get the indices for the upper triangle (excluding diagonal)
-    triu_indices = np.triu_indices(N, k=1)
-    
-    # Randomly select indices to assign non-zero Gaussian values
-    if total_elements > 0 and num_nonzero > 0:
-        selected_indices = rng.choice(total_elements, size=num_nonzero, replace=False)
-        # Map the selected flat indices to row and column indices
-        rows = triu_indices[0][selected_indices]
-        cols = triu_indices[1][selected_indices]
-        # Assign Gaussian-distributed values to the selected positions
-        J_upper[rows, cols] = rng.normal(loc=0.0, scale=sig_J, size=num_nonzero)
-    
-    # Symmetrize the matrix to make Jij symmetric
-    Jij = J_upper + J_upper.T
+    return results
 
-    return Jij
-
-def init_h(N, beta, random_state=None):
+def plot_ruggedness_analysis(results):
     """
-    Initialize the external fields for the Sherrington-Kirkpatrick model.
-
-    Parameters
-    ----------
-    N : int
-        The number of spins.
-    beta : float
-    random_state : int or numpy.random.Generator, optional
-        Seed or generator for reproducibility.
-
-    Returns
-    -------
-    numpy.ndarray
-        The external fields.
+    Plot the results of the ruggedness analysis.
+    
+    Args:
+        results (dict): Results from analyze_NK_model_ruggedness
+        
+    Returns:
+        matplotlib.figure.Figure: The plot figure
     """
-    rng = np.random.default_rng(random_state)
-    sig_h = np.sqrt(1 - beta)
-    return rng.normal(0.0, sig_h, N)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    
+    # Plot number of local optima vs K
+    if results['avg_local_optima'][0] is not None:
+        ax1.errorbar(results['K_values'], results['avg_local_optima'], 
+                    yerr=results['local_optima_stderr'], fmt='-o')
+        ax1.set_xlabel('K (Epistatic Interactions)')
+        ax1.set_ylabel('Average Number of Local Optima')
+        ax1.set_title('Landscape Ruggedness vs K')
+        ax1.grid(True, alpha=0.3)
+    else:
+        ax1.text(0.5, 0.5, 'Local optima analysis not available for large N', 
+                ha='center', va='center')
+        ax1.set_title('Landscape Ruggedness (N too large)')
+    
+    # Plot average fitness vs K
+    ax2.errorbar(results['K_values'], results['avg_fitness'], 
+                yerr=results['fitness_stderr'], fmt='-o', color='orange')
+    ax2.set_xlabel('K (Epistatic Interactions)')
+    ax2.set_ylabel('Average Fitness')
+    ax2.set_title('Average Fitness vs K')
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    return fig
 
+def visualize_multiple_landscapes(N, K_values, seed=42):
+    """
+    Create visualization of landscapes with different K values.
+    
+    Args:
+        N (int): Number of genes
+        K_values (list): List of K values to visualize
+        seed (int): Random seed for reproducibility
+        
+    Returns:
+        matplotlib.figure.Figure: The plot figure
+    """
+    num_plots = len(K_values)
+    fig = plt.figure(figsize=(5*num_plots, 5))
+    
+    for i, K in enumerate(K_values):
+        model = NKModel(N=N, K=K, seed=seed)
+        
+        if N <= 2:
+            # For N=1 or N=2, we can visualize exact landscape
+            ax = fig.add_subplot(1, num_plots, i+1, projection='3d' if N==2 else None)
+            
+            if N == 1:
+                genomes = [(0,), (1,)]
+                fitnesses = [model.calculate_fitness(g) for g in genomes]
+                ax.bar([0, 1], fitnesses)
+                ax.set_xticks([0, 1])
+                ax.set_xticklabels(['0', '1'])
+                ax.set_xlabel('Gene Value')
+                ax.set_ylabel('Fitness')
+            else:  # N == 2
+                x = np.array([0, 0, 1, 1])
+                y = np.array([0, 1, 0, 1])
+                genomes = [(x[i], y[i]) for i in range(4)]
+                fitnesses = [model.calculate_fitness(g) for g in genomes]
+                
+                ax.plot_trisurf(x, y, fitnesses, cmap=cm.viridis, linewidth=0.2)
+                ax.set_xlabel('Gene 1')
+                ax.set_ylabel('Gene 2')
+                ax.set_zlabel('Fitness')
+                
+            ax.set_title(f'K={K}')
+        else:
+            # For N>2, show heatmap projection
+            ax = fig.add_subplot(1, num_plots, i+1)
+            
+            # Generate all combinations of the first two genes
+            z = np.zeros((2, 2))
+            samples_per_cell = 50
+            
+            for i1, x in enumerate([0, 1]):
+                for j1, y in enumerate([0, 1]):
+                    avg_fitness = 0
+                    for _ in range(samples_per_cell):
+                        # Generate random values for the other N-2 genes
+                        other_genes = np.random.randint(0, 2, N - 2)
+                        genome = np.array([x, y, *other_genes])
+                        avg_fitness += model.calculate_fitness(genome)
+                    z[i1, j1] = avg_fitness / samples_per_cell
+            
+            # Create heatmap
+            sns.heatmap(z, annot=True, fmt=".3f", cmap="viridis", 
+                      xticklabels=[0, 1], yticklabels=[0, 1],
+                      cbar_kws={'label': 'Avg Fitness'}, ax=ax)
+            ax.set_xlabel('Gene 2')
+            ax.set_ylabel('Gene 1')
+            ax.set_title(f'K={K} (Avg Fitness Projection)')
+    
+    plt.tight_layout()
+    return fig
 
-#%%
-def main():
-    # Simulation parameters
-    genome_size = 10
-    population_size = 10
-    generations = 3
-    beta = 0.5
-    rho = 0.25
-    fitness_model = "dominant"  # "dominant", "recessive", "codominant"
-    mutation_seed = 42
-
-    # Initialize environment
-    env = Environment(
-        genome_size=genome_size,
-        beta=beta,
-        rho=rho,
-        seed=123,
-        fitness_method=AlternativeFitnessMethod.SHERRINGTON_KIRKPATRICK
+def create_3d_fitness_landscape(N, K_values, num_genes_to_plot=3, seed=42):
+    """
+    Create interactive 3D visualizations of fitness landscapes for different K values using Plotly.
+    
+    Args:
+        N (int): Total number of genes
+        K_values (list): List of K values to visualize
+        num_genes_to_plot (int): Number of genes to include in the 3D plot (2 or 3)
+        seed (int): Random seed for reproducibility
+        
+    Returns:
+        plotly.graph_objects.Figure: Interactive 3D plot figure
+    """
+    if num_genes_to_plot not in [2, 3]:
+        raise ValueError("num_genes_to_plot must be 2 or 3")
+    
+    # Filter K values to ensure they are less than N
+    valid_K_values = [k for k in K_values if k < N]
+    if not valid_K_values:
+        valid_K_values = [0, min(1, N-1)]
+    
+    num_plots = len(valid_K_values)
+    
+    # Dynamically adjust the number of rows and columns based on the number of plots
+    num_cols = min(3, num_plots)  # Maximum 3 columns per row
+    num_rows = (num_plots + num_cols - 1) // num_cols  # Calculate required rows
+    print(f"Creating {num_rows} rows and {num_cols} columns for {num_plots} plots.")
+    
+    # Create specs for each subplot
+    specs = [[{'type': 'scene'} for _ in range(num_cols)] for _ in range(num_rows)]
+    
+    # Create subplot titles
+    subplot_titles = [f'K={K}' for K in valid_K_values]
+    
+    # Create subplot figure
+    fig = make_subplots(
+        rows=num_rows, cols=num_cols,
+        specs=specs,
+        subplot_titles=subplot_titles
     )
+    
+    for plot_idx, K in enumerate(valid_K_values):
+        # Create model with specified K value
+        model = NKModel(N=N, K=K, seed=seed)
+        
+        if num_genes_to_plot == 2:
+            # For 2 genes with fitness as 3rd dimension
+            # Generate all possible states for these 2 genes
+            all_states = list(itertools.product([0, 1], repeat=2))
+            x = [state[0] for state in all_states]
+            y = [state[1] for state in all_states]
+            
+            # Calculate average fitness for each state
+            z = []
+            for g1, g2 in all_states:
+                # For each state, generate and average multiple random configurations of other genes
+                avg_fitness = 0
+                num_samples = 50
+                for _ in range(num_samples):
+                    # Generate random values for other N-2 genes
+                    other_genes = np.random.RandomState(seed).randint(0, 2, N - 2)
+                    genome = np.array([g1, g2, *other_genes])
+                    avg_fitness += model.calculate_fitness(genome)
+                z.append(avg_fitness / num_samples)
+            
+            # Create scatter3d trace
+            scatter = go.Scatter3d(
+                x=x,
+                y=y,
+                z=z,
+                mode='markers',
+                marker=dict(
+                    size=10,
+                    color=z,
+                    colorscale='Viridis',
+                    opacity=0.8,
+                    colorbar=dict(title="Fitness")
+                ),
+                text=[f'Genome: [{g1}, {g2}]<br>Fitness: {fitness:.4f}' 
+                      for (g1, g2), fitness in zip(all_states, z)],
+                hoverinfo='text',
+                name=f'K={K}'
+            )
+            
+            # Create surface connecting the points
+            surface_x, surface_y = np.meshgrid([0, 1], [0, 1])
+            surface_z = np.array(z).reshape(2, 2)
+            
+            surface = go.Surface(
+                x=surface_x,
+                y=surface_y,
+                z=surface_z,
+                colorscale='Viridis',
+                opacity=0.5,
+                showscale=False,
+            )
+            
+            # Calculate row and column for this subplot
+            row_idx = plot_idx // num_cols + 1  # 1-indexed
+            col_idx = plot_idx % num_cols + 1   # 1-indexed
+            
+            # Add traces to the figure
+            fig.add_trace(scatter, row=row_idx, col=col_idx)
+            fig.add_trace(surface, row=row_idx, col=col_idx)
+            
+            # Update axis labels
+            fig.update_scenes(
+                xaxis_title="Gene 1",
+                yaxis_title="Gene 2",
+                zaxis_title="Fitness",
+                xaxis=dict(tickvals=[0, 1]),
+                yaxis=dict(tickvals=[0, 1]),
+                row=row_idx, col=col_idx
+            )
+            
+        elif num_genes_to_plot == 3:
+            # For 3 genes with fitness as color
+            all_states = list(itertools.product([0, 1], repeat=3))
+            x = [state[0] for state in all_states]
+            y = [state[1] for state in all_states]
+            z = [state[2] for state in all_states]
+            
+            # Calculate fitness for each state
+            fitnesses = []
+            for g1, g2, g3 in all_states:
+                # For each state, generate and average multiple random configurations of other genes
+                avg_fitness = 0
+                num_samples = 50 if N > 3 else 1
+                for _ in range(num_samples):
+                    # Generate random values for other N-3 genes
+                    if N > 3:
+                        other_genes = np.random.RandomState(seed).randint(0, 2, N - 3)
+                        genome = np.array([g1, g2, g3, *other_genes])
+                    else:
+                        genome = np.array([g1, g2, g3])
+                    avg_fitness += model.calculate_fitness(genome)
+                fitnesses.append(avg_fitness / num_samples)
+            
+            # Create scatter3d trace
+            scatter = go.Scatter3d(
+                x=x,
+                y=y,
+                z=z,
+                mode='markers',
+                marker=dict(
+                    size=10,
+                    color=fitnesses,
+                    colorscale='Viridis',
+                    opacity=0.8,
+                    colorbar=dict(title="Fitness")
+                ),
+                text=[f'Genome: [{g1}, {g2}, {g3}]<br>Fitness: {fitness:.4f}' 
+                      for (g1, g2, g3), fitness in zip(all_states, fitnesses)],
+                hoverinfo='text',
+                name=f'K={K}'
+            )
+            
+            # Add edges between points that differ by one bit
+            edges_x = []
+            edges_y = []
+            edges_z = []
+            
+            for i, state1 in enumerate(all_states):
+                for j, state2 in enumerate(all_states):
+                    if sum(abs(np.array(state1) - np.array(state2))) == 1:
+                        edges_x.extend([state1[0], state2[0], None])
+                        edges_y.extend([state1[1], state2[1], None])
+                        edges_z.extend([state1[2], state2[2], None])
+            
+            edges = go.Scatter3d(
+                x=edges_x,
+                y=edges_y,
+                z=edges_z,
+                mode='lines',
+                line=dict(color='gray', width=1),
+                hoverinfo='none',
+                showlegend=False
+            )
+            
+            # Calculate row and column for this subplot
+            row_idx = plot_idx // num_cols + 1  # 1-indexed
+            col_idx = plot_idx % num_cols + 1   # 1-indexed
+            
+            # Add traces to the figure
+            fig.add_trace(scatter, row=row_idx, col=col_idx)
+            fig.add_trace(edges, row=row_idx, col=col_idx)
+            
+            # Update axis labels
+            fig.update_scenes(
+                xaxis_title="Gene 1",
+                yaxis_title="Gene 2",
+                zaxis_title="Gene 3",
+                xaxis=dict(tickvals=[0, 1]),
+                yaxis=dict(tickvals=[0, 1]),
+                zaxis=dict(tickvals=[0, 1]),
+                row=row_idx, col=col_idx
+            )
+    
+    # Update layout
+    fig.update_layout(
+        title_text=f"NK Model Fitness Landscape (N={N})",
+        height=600 * num_rows,  # Adjust height based on number of rows
+        width=1200 if num_plots > 1 else 800,
+        margin=dict(l=0, r=0, b=0, t=50)
+    )
+    
+    return fig
 
-    print("Fitness method:", env.get_fitness_description())
+def create_3d_landscape_with_adaptive_walk(N, K_values, seed=42):
+    """
+    Create interactive 3D visualizations of fitness landscapes with an adaptive walk path
+    
+    Args:
+        N (int): Total number of genes
+        K_values (list): List of K values to visualize
+        seed (int): Random seed for reproducibility
+        
+    Returns:
+        plotly.graph_objects.Figure: Interactive 3D plot figure
+    """
+    # For adaptive walk, we'll use a smaller N to make it more visible
+    small_N = min(N, 3)
+    
+    # Filter K values to ensure they are less than small_N
+    valid_K_values = [k for k in K_values if k < small_N]
+    if not valid_K_values:
+        valid_K_values = [0, small_N-1]  # Default to 0 and N-1 if no valid K values
+    
+    num_plots = len(valid_K_values)
+    
+    # Dynamically adjust the number of rows and columns based on the number of plots
+    num_cols = min(3, num_plots)  # Maximum 3 columns per row
+    num_rows = (num_plots + num_cols - 1) // num_cols  # Calculate required rows
+    print(f"Creating {num_rows} rows and {num_cols} columns for {num_plots} plots.")
+    
+    # Create specs for each subplot
+    specs = [[{'type': 'scene'} for _ in range(num_cols)] for _ in range(num_rows)]
+    
+    # Create subplot titles
+    subplot_titles = [f'K={K} with Adaptive Walk' for K in valid_K_values]
+    
+    # Create subplot figure
+    fig = make_subplots(
+        rows=num_rows, cols=num_cols,
+        specs=specs,
+        subplot_titles=subplot_titles
+    )
+    
+    for plot_idx, K in enumerate(valid_K_values):
+        # Create model with specified K value
+        model = NKModel(N=small_N, K=K, seed=seed)
+        
+        # Generate all possible genomes
+        all_genomes = list(itertools.product([0, 1], repeat=small_N))
+        
+        # Calculate fitness for each genome
+        fitnesses = [model.calculate_fitness(genome) for genome in all_genomes]
+        
+        # Create 3D coordinates for genomes
+        if small_N == 3:
+            x = [genome[0] for genome in all_genomes]
+            y = [genome[1] for genome in all_genomes]
+            z = [genome[2] for genome in all_genomes]
+            
+            # Create scatter3d for genomes
+            scatter = go.Scatter3d(
+                x=x,
+                y=y,
+                z=z,
+                mode='markers',
+                marker=dict(
+                    size=[10 + 20*f for f in fitnesses],
+                    color=fitnesses,
+                    colorscale='Viridis',
+                    opacity=0.7,
+                    colorbar=dict(title="Fitness")
+                ),
+                text=[f'Genome: {genome}<br>Fitness: {fitness:.4f}' 
+                      for genome, fitness in zip(all_genomes, fitnesses)],
+                hoverinfo='text',
+                name=f'Genomes K={K}'
+            )
+            
+            # Add edges between points that differ by one bit
+            edges_x = []
+            edges_y = []
+            edges_z = []
+            
+            for i, g1 in enumerate(all_genomes):
+                for j, g2 in enumerate(all_genomes):
+                    if sum(abs(np.array(g1) - np.array(g2))) == 1:
+                        edges_x.extend([g1[0], g2[0], None])
+                        edges_y.extend([g1[1], g2[1], None])
+                        edges_z.extend([g1[2], g2[2], None])
+            
+            edges = go.Scatter3d(
+                x=edges_x,
+                y=edges_y,
+                z=edges_z,
+                mode='lines',
+                line=dict(color='gray', width=1),
+                hoverinfo='none',
+                showlegend=False
+            )
+            
+            # Calculate row and column for this subplot
+            row_idx = plot_idx // num_cols + 1  # 1-indexed
+            col_idx = plot_idx % num_cols + 1   # 1-indexed
+            
+            # Add traces to the figure
+            fig.add_trace(scatter, row=row_idx, col=col_idx)
+            fig.add_trace(edges, row=row_idx, col=col_idx)
+            
+        elif small_N == 2:
+            x = [genome[0] for genome in all_genomes]
+            y = [genome[1] for genome in all_genomes]
+            z = fitnesses
+            
+            # Create scatter3d for genomes
+            scatter = go.Scatter3d(
+                x=x,
+                y=y,
+                z=z,
+                mode='markers',
+                marker=dict(
+                    size=12,
+                    color=z,
+                    colorscale='Viridis',
+                    opacity=0.8,
+                    colorbar=dict(title="Fitness")
+                ),
+                text=[f'Genome: {genome}<br>Fitness: {fitness:.4f}' 
+                      for genome, fitness in zip(all_genomes, fitnesses)],
+                hoverinfo='text',
+                name=f'Genomes K={K}'
+            )
+            
+            # Create surface connecting the points
+            x_grid, y_grid = np.meshgrid([0, 1], [0, 1])
+            z_grid = np.array(fitnesses).reshape(2, 2)
+            
+            surface = go.Surface(
+                x=x_grid,
+                y=y_grid,
+                z=z_grid,
+                colorscale='Viridis',
+                opacity=0.5,
+                showscale=False,
+            )
+            
+            # Calculate row and column for this subplot
+            row_idx = plot_idx // num_cols + 1  # 1-indexed
+            col_idx = plot_idx % num_cols + 1   # 1-indexed
+            
+            # Add traces to the figure
+            fig.add_trace(scatter, row=row_idx, col=col_idx)
+            fig.add_trace(surface, row=row_idx, col=col_idx)
+        
+        # Simulate an adaptive walk from a random starting point
+        start_idx = 0  # Start from genome [0, 0, 0] or [0, 0]
+        current_genome = all_genomes[start_idx]
+        walk_path = [current_genome]
+        
+        # Greedy hill climbing until reaching a local optimum
+        while True:
+            # Get all neighbors (1-bit mutations)
+            neighbors = []
+            for i in range(small_N):
+                neighbor = list(current_genome)
+                neighbor[i] = 1 - neighbor[i]  # Flip bit
+                neighbors.append(tuple(neighbor))
+            
+            # Find the fittest neighbor
+            neighbor_fitnesses = [model.calculate_fitness(n) for n in neighbors]
+            best_neighbor_idx = np.argmax(neighbor_fitnesses)
+            best_neighbor = neighbors[best_neighbor_idx]
+            best_fitness = neighbor_fitnesses[best_neighbor_idx]
+            
+            # Stop if no improvement
+            if best_fitness <= model.calculate_fitness(current_genome):
+                break
+                
+            # Move to best neighbor
+            current_genome = best_neighbor
+            walk_path.append(current_genome)
+        
+        # Plot the adaptive walk path
+        walk_x = [g[0] for g in walk_path]
+        walk_y = [g[1] for g in walk_path]
+        
+        if small_N == 3:
+            walk_z = [g[2] for g in walk_path]
+            
+            # Create line trace for the walk path
+            walk_trace = go.Scatter3d(
+                x=walk_x,
+                y=walk_y,
+                z=walk_z,
+                mode='lines+markers',
+                line=dict(color='red', width=6),
+                marker=dict(
+                    size=8,
+                    color='red',
+                ),
+                name='Adaptive Walk'
+            )
+            
+            fig.add_trace(walk_trace, row=row_idx, col=col_idx)
+            
+            # Update axis labels
+            fig.update_scenes(
+                xaxis_title="Gene 1",
+                yaxis_title="Gene 2",
+                zaxis_title="Gene 3",
+                xaxis=dict(tickvals=[0, 1]),
+                yaxis=dict(tickvals=[0, 1]),
+                zaxis=dict(tickvals=[0, 1]),
+                row=row_idx, col=col_idx
+            )
+            
+        elif small_N == 2:
+            walk_z = [model.calculate_fitness(g) for g in walk_path]
+            
+            # Create line trace for the walk path
+            walk_trace = go.Scatter3d(
+                x=walk_x,
+                y=walk_y,
+                z=walk_z,
+                mode='lines+markers',
+                line=dict(color='red', width=6),
+                marker=dict(
+                    size=8,
+                    color='red',
+                ),
+                name='Adaptive Walk'
+            )
+            
+            fig.add_trace(walk_trace, row=row_idx, col=col_idx)
+            
+            # Update axis labels
+            fig.update_scenes(
+                xaxis_title="Gene 1",
+                yaxis_title="Gene 2",
+                zaxis_title="Fitness",
+                xaxis=dict(tickvals=[0, 1]),
+                yaxis=dict(tickvals=[0, 1]),
+                row=row_idx, col=col_idx
+            )
+            
+    # Update layout
+    fig.update_layout(
+        title_text=f"NK Model Fitness Landscape with Adaptive Walk (N={small_N})",
+        height=600 * num_rows,  # Adjust height based on number of rows
+        width=1200 if num_plots > 1 else 800,
+        margin=dict(l=0, r=0, b=0, t=50)
+    )
+    
+    return fig
 
-    # Create initial population
-    population = [
-        Organism(env, generation=0, genome_seed=i, mutation_seed=mutation_seed)
-        for i in range(population_size)
-    ]
 
-    print(f"Initial population (size {len(population)}):")
-    for i, org in enumerate(population):
-        print(f"Organism {i}: Fitness = {org.fitness:.4f}, Genome = {org.genome}")
-
-    # Reproduce for specified generations
-    for gen in range(1, generations + 1):
-        print(f"\nGeneration {gen}:")
-        next_gen = []
-
-        # Simple one-to-one mating strategy
-        for i in range(0, len(population), 2):
-            parent1 = population[i]
-            parent2 = population[(i + 1) % len(population)]  # wrap around for even pairing
-
-            # Create diploid organism
-            diploid = DiploidOrganism(parent1, parent2, fitness_model=fitness_model)
-
-            print(f"Diploid from {i} and {(i + 1) % len(population)} -> Fitness: {diploid.fitness:.4f}, Effective Genome: {diploid._get_effective_genome()}")
-
-            # Reproduce to form haploid children from each diploid parent
-            child1, child2 = parent1.reproduce(mutation_seed=mutation_seed)
-            next_gen.extend([child1, child2])
-
-        # Limit population to original size
-        population = next_gen[:population_size]
-
-#%%
+# Main execution
 if __name__ == "__main__":
-    main()
+    # Parameters
+    N = 11  # Number of genes
+    K_values = [0, 1, 2, 3, 4, 5 , 6, 7, 8, 9]  # Different K values to analyze
+    
+    # Analyze ruggedness for different K values
+    print(f"Analyzing NK model with N={N} and K values {K_values}")
+    results = analyze_NK_model_ruggedness(N, K_values)
+    
+    # Plot results
+    fig1 = plot_ruggedness_analysis(results)
+    plt.show()
 
+    # For visualization, use a smaller N
+    vis_N = 10
+    vis_K_values = [0, 2, vis_N-1]
+    
+    print(f"Visualizing landscapes with N={vis_N} and K values {vis_K_values}")
+    fig2 = visualize_multiple_landscapes(vis_N, vis_K_values)
+    plt.show()
+    
+    
+    # Explanation of epistasis
+    print("\nEpistasis Explanation:")
+    print("----------------------")
+    print("Epistasis refers to the phenomenon where the effect of one gene mutation")
+    print("is influenced by the presence or absence of mutations in other genes.")
+    print("In the NK model, K controls the degree of epistatic interactions:")
+    print("- K=0: No epistasis - each gene contributes independently to fitness")
+    print("- K>0: Epistatic interactions - a gene's contribution depends on K other genes")
+    print("- K=N-1: Maximum epistasis - each gene interacts with all other genes")
+    print()
+    print("As K increases, the fitness landscape becomes more rugged with many local")
+    print("optima, making it harder for evolutionary processes to find the global")
+    print("optimum. This occurs because changing one gene affects the fitness")
+    print("contributions of K other genes, creating complex interdependencies that")
+    print("result in a more complex, multi-peaked landscape.")
 
-# %%
+    # fig1 = create_3d_fitness_landscape(N, K_values, num_genes_to_plot=2)
+    # fig1.show()
+
+    # fig2 = create_3d_fitness_landscape(N, K_values, num_genes_to_plot=3)
+    # fig2.show()
+
+    # fig3 = create_3d_landscape_with_adaptive_walk(3, K_values)
+    # fig3.show()
